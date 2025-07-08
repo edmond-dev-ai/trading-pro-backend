@@ -1,0 +1,18 @@
+# Python Virtual Environment
+/venv
+/.venv
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated database files
+*.db
+
+# Data files
+/data/
+
+# IDE / OS files
+.vscode/
+.idea/
+*.DS_Store
