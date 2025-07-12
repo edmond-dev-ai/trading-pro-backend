@@ -10,8 +10,6 @@ from datetime import datetime, timedelta
 DATABASE_FILE = 'data/trading_data.db'
 CACHE = {}
 LOG = logging.getLogger("uvicorn")
-# Define the session open time as a constant
-MARKET_OPEN_HOUR_UTC = 21
 
 # --- Helper Functions ---
 
