@@ -25,6 +25,44 @@ def format_instrument_to_tablename(instrument: str, timeframe: str) -> str:
         
     return f"{formatted_instrument}_{timeframe}"
 
+def get_market_type(instrument: str) -> str:
+    """
+    Determines the market type based on instrument to apply correct daily alignment.
+    """
+    instrument_upper = instrument.upper()
+    
+    # Gold and precious metals - METALS_AND_INDICES
+    if instrument_upper in ['XAUUSD', 'XAGUSD', 'XAU_USD', 'XAG_USD']:
+        return 'METALS_AND_INDICES'
+    
+    # Stock indices (common ones) - METALS_AND_INDICES
+    elif any(idx in instrument_upper for idx in ['SPX', 'NAS', 'DOW', 'DAX', 'FTSE', 'NIKKEI', 'ASX']):
+        return 'METALS_AND_INDICES'
+    
+    # Forex pairs (most common pattern) - FOREX_AND_CRYPTO
+    elif len(instrument_upper) == 6 or '_' in instrument_upper:
+        return 'FOREX_AND_CRYPTO'
+    
+    # Crypto - FOREX_AND_CRYPTO
+    elif any(crypto in instrument_upper for crypto in ['BTC', 'ETH', 'LTC', 'XRP']):
+        return 'FOREX_AND_CRYPTO'
+    
+    # Default to forex behavior
+    return 'FOREX_AND_CRYPTO'
+
+def get_daily_offset(instrument: str) -> str:
+    """
+    Returns the daily offset based on market type and Oanda's session times.
+    - Metals/Indices: 21:00 UTC (actual market open time)
+    - Forex/Crypto: 21:00 UTC (24/7 market with daily reset at 21:00)
+    """
+    market_type = get_market_type(instrument)
+    
+    if market_type == 'METALS_AND_INDICES':
+        return '21H'  # 21:00 UTC start (actual market open)
+    else:  # FOREX_AND_CRYPTO
+        return '21H'  # 21:00 UTC start
+
 def get_pandas_timeframe(timeframe_str: str) -> str:
     timeframe_str = timeframe_str.upper()
     if 'M' in timeframe_str and 'MO' not in timeframe_str:
@@ -35,14 +73,247 @@ def get_pandas_timeframe(timeframe_str: str) -> str:
         return timeframe_str.replace('H', 'h')
     return timeframe_str
 
-def resample_data(df, rule):
+def is_daily_or_above(timeframe: str) -> bool:
+    """
+    Check if timeframe is daily or above (D, W, MO)
+    """
+    timeframe_upper = timeframe.upper()
+    return 'D' in timeframe_upper or 'W' in timeframe_upper or 'MO' in timeframe_upper
+
+def get_resample_anchor(timeframe: str, instrument: str = None) -> str:
+    """
+    Returns the proper anchor for resampling based on timeframe and instrument.
+    
+    For metals/indices (have trading gaps):
+    - Daily and above: Use market-specific alignment (21:00 UTC offset)
+    - Hour-based timeframes: Use even/odd logic for TradingView alignment
+      * Even hours (2H, 4H, 6H, 8H, etc.): Use TradingView alignment with 1H offset
+      * Odd hours (3H, 5H, 7H, etc.): Use actual timestamp alignment (no offset)
+    - Minute timeframes: Standard resampling
+    
+    For forex/crypto (continuous 24/7 data):
+    - ALL timeframes: Use right labeling with right boundary to match TradingView timestamps
+    """
+    timeframe_upper = timeframe.upper()
+    market_type = get_market_type(instrument) if instrument else 'FOREX_AND_CRYPTO'
+    
+    # For forex/crypto - use -1 offset for ALL timeframes
+    if market_type == 'FOREX_AND_CRYPTO':
+        return 'FOREX_CRYPTO_OFFSET'
+    
+    # For metals/indices only - apply different logic based on timeframe
+    elif market_type == 'METALS_AND_INDICES':
+        # For daily and above timeframes
+        if is_daily_or_above(timeframe):
+            if 'D' in timeframe_upper:
+                return 'D_MARKET_SPECIFIC'
+            elif 'W' in timeframe_upper:
+                return 'W_MARKET_SPECIFIC'
+            else:  # Monthly
+                return 'MO_MARKET_SPECIFIC'
+        
+        # For hour-based timeframes (even/odd logic for metals/indices only)
+        elif 'H' in timeframe_upper:
+            hours = int(timeframe_upper.replace('H', ''))
+            if hours == 1:
+                return 'H_NO_OFFSET'  # 1H doesn't need offset
+            elif hours % 2 == 0:  # Even hours (2H, 4H, 6H, 8H, etc.)
+                return 'H_EVEN_OFFSET'  # Use TradingView alignment with 1H offset
+            else:  # Odd hours (3H, 5H, 7H, etc.)
+                return 'H_ODD_NO_OFFSET'  # Use actual timestamp alignment
+        
+        # For minute timeframes (standard resampling for metals/indices)
+        else:
+            return None
+    
+    # Default fallback
+    return None
+
+def resample_data(df, rule, instrument=None):
+    """
+    Resamples OHLCV data with different strategies based on instrument type.
+    
+    For metals/indices (XAUUSD) - have trading gaps:
+    - Daily and above: Use market-specific offset (21:00 UTC)
+    - Hour-based: Use even/odd logic for TradingView alignment
+    - Minutes: Standard resampling
+    
+    For forex/crypto (EURUSD, BTCUSDT) - continuous 24/7 data:
+    - ALL timeframes: Use -3H offset with left labeling to match TradingView timestamps
+    """
     resampling_rules = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
     if 'Volume' in df.columns:
         resampling_rules['Volume'] = 'sum'
     
     pandas_rule = get_pandas_timeframe(rule)
-    resampled_df = df.resample(pandas_rule, label='left', closed='left').apply(resampling_rules).dropna()
+    anchor = get_resample_anchor(rule, instrument)
+    
+    # Ensure the DataFrame index is timezone-aware UTC
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
+    elif df.index.tz != 'UTC':
+        df.index = df.index.tz_convert('UTC')
+    
+    # Handle different anchor types
+    if anchor == 'FOREX_CRYPTO_OFFSET':
+        # For forex/crypto (ALL timeframes) - use origin and offset for proper alignment
+        timeframe_upper = rule.upper()
+        
+        if 'H' in timeframe_upper:
+            hours = int(timeframe_upper.replace('H', ''))
+            if hours == 1:
+                # 1H: use offset to match TradingView (showing 7 instead of 8)
+                resampled_df = df.resample(
+                    pandas_rule,
+                    origin='start_day',
+                    offset='-1H',     # Start 1 hour earlier
+                    label='left',
+                    closed='right'
+                ).apply(resampling_rules).dropna()
+            else:
+                # Multi-hour timeframes: align to midnight (00:00)
+                resampled_df = df.resample(
+                    pandas_rule,
+                    origin='start_day',  # Start from midnight 00:00
+                    label='left',
+                    closed='left'
+                ).apply(resampling_rules).dropna()
+        else:
+            # Daily and above: standard resampling
+            resampled_df = df.resample(
+                pandas_rule,
+                origin='start_day',
+                offset='-1H',
+                label='left',
+                closed='right'
+            ).apply(resampling_rules).dropna()
+    
+    elif anchor == 'H_EVEN_OFFSET':
+        # Even hour timeframes for metals/indices only - use TradingView alignment
+        # These align to 01:00, 03:00, 05:00, etc. instead of 00:00, 02:00, 04:00
+        resampled_df = df.resample(
+            pandas_rule, 
+            origin='start_day',  # Start from beginning of day (00:00 UTC)
+            offset='1H',         # 1 hour offset to align with TradingView's timing
+            label='left',        # Label with the start time of the interval
+            closed='left'        # Include left boundary, exclude right
+        ).apply(resampling_rules).dropna()
+    
+    elif anchor == 'H_ODD_NO_OFFSET':
+        # Odd hour timeframes for metals/indices only - use actual timestamp alignment
+        # These align to 00:00, 03:00, 06:00, 09:00, etc. (natural hour boundaries)
+        resampled_df = df.resample(
+            pandas_rule,
+            origin='start_day',  # Start from beginning of day (00:00 UTC)
+            # No offset - use natural hour boundaries
+            label='left',
+            closed='left'
+        ).apply(resampling_rules).dropna()
+    
+    elif anchor == 'H_NO_OFFSET':
+        # 1H timeframe for metals/indices - no offset needed
+        resampled_df = df.resample(
+            pandas_rule,
+            label='left',
+            closed='left'
+        ).apply(resampling_rules).dropna()
+    
+    elif anchor == 'D_MARKET_SPECIFIC':
+        # Daily timeframe with market-specific offset (metals/indices only)
+        daily_offset = get_daily_offset(instrument)
+        resampled_df = df.resample(
+            pandas_rule,
+            origin='start_day',
+            offset=daily_offset,    # Market-specific daily start time (21:00 UTC)
+            label='left',
+            closed='left'
+        ).apply(resampling_rules).dropna()
+    
+    elif anchor == 'W_MARKET_SPECIFIC':
+        # Weekly timeframe with market-specific offset (metals/indices only)
+        daily_offset = get_daily_offset(instrument)
+        resampled_df = df.resample(
+            pandas_rule,
+            origin='start_day',
+            offset=daily_offset,    # Use same offset as daily for weekly alignment
+            label='left',
+            closed='left'
+        ).apply(resampling_rules).dropna()
+    
+    elif anchor == 'MO_MARKET_SPECIFIC':
+        # Monthly timeframe with market-specific offset (metals/indices only)
+        daily_offset = get_daily_offset(instrument)
+        resampled_df = df.resample(
+            pandas_rule,
+            origin='start_day',
+            offset=daily_offset,    # Use same offset as daily for monthly alignment
+            label='left',
+            closed='left'
+        ).apply(resampling_rules).dropna()
+    
+    # For other timeframes, use standard resampling (metals/indices minute timeframes)
+    else:
+        # Minute-based timeframes (1m, 5m, 15m, 30m) - no offset needed
+        resampled_df = df.resample(
+            pandas_rule, 
+            label='left', 
+            closed='left'
+        ).apply(resampling_rules).dropna()
+    
     return resampled_df
+
+# --- ADDED: Alternative manual 4H resampling function ---
+def resample_4h_tradingview_manual(df):
+    """
+    Manual 4H resampling that exactly matches TradingView's behavior.
+    TradingView 4H candles: 01:00-05:00, 05:00-09:00, 09:00-13:00, 13:00-17:00, 17:00-21:00, 21:00-01:00
+    """
+    resampling_rules = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
+    if 'Volume' in df.columns:
+        resampling_rules['Volume'] = 'sum'
+    
+    # Ensure UTC timezone
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
+    elif df.index.tz != 'UTC':
+        df.index = df.index.tz_convert('UTC')
+    
+    # Create a custom grouper for TradingView 4H alignment
+    def get_tradingview_4h_group(timestamp):
+        hour = timestamp.hour
+        # TradingView 4H groups: 1-4->1, 5-8->5, 9-12->9, 13-16->13, 17-20->17, 21-24/0->21
+        if 1 <= hour <= 4:
+            group_hour = 1
+        elif 5 <= hour <= 8:
+            group_hour = 5
+        elif 9 <= hour <= 12:
+            group_hour = 9
+        elif 13 <= hour <= 16:
+            group_hour = 13
+        elif 17 <= hour <= 20:
+            group_hour = 17
+        else:  # 21-24 and 0
+            if hour >= 21:
+                group_hour = 21
+            else:  # hour == 0
+                # Midnight belongs to the 21:00-01:00 group of the previous day
+                prev_day = timestamp - pd.Timedelta(days=1)
+                return prev_day.replace(hour=21, minute=0, second=0, microsecond=0)
+        
+        return timestamp.replace(hour=group_hour, minute=0, second=0, microsecond=0)
+    
+    # Group by 4H periods and resample
+    df_grouped = df.groupby(get_tradingview_4h_group).apply(
+        lambda x: pd.Series({
+            'Open': x['Open'].iloc[0] if len(x) > 0 else None,
+            'High': x['High'].max() if len(x) > 0 else None,
+            'Low': x['Low'].min() if len(x) > 0 else None,
+            'Close': x['Close'].iloc[-1] if len(x) > 0 else None,
+            'Volume': x['Volume'].sum() if 'Volume' in x.columns and len(x) > 0 else None
+        })
+    ).dropna()
+    
+    return df_grouped
 
 def get_data_from_db(table_name):
     if table_name in CACHE:
@@ -173,10 +444,10 @@ async def get_chart_data(
         anchor_end_minutes = anchor_end_dt.hour * 60 + anchor_end_dt.minute
         target_candle_start_minutes = (anchor_end_minutes // target_timeframe_minutes) * target_timeframe_minutes
         target_candle_start_dt = anchor_start_dt.replace(hour=0, minute=0, second=0, microsecond=0) + pd.to_timedelta(target_candle_start_minutes, unit='m')
-        resampled_df = resample_data(base_df.copy(), timeframe)
+        resampled_df = resample_data(base_df.copy(), timeframe, instrument)
         final_df = resampled_df[resampled_df.index <= target_candle_start_dt].tail(limit)
     else:
-        final_df = resample_data(base_df.copy(), timeframe)
+        final_df = resample_data(base_df.copy(), timeframe, instrument)
         if after_date:
             after_datetime = pd.to_datetime(after_date, utc=True)
             final_df = final_df[final_df.index > after_datetime].head(limit)
