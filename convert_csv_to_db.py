@@ -1,43 +1,71 @@
 import pandas as pd
 import sqlite3
 import os
+import glob
 
 # --- CONFIGURATION ---
-CSV_FILE_PATH = os.path.join('data', 'XAU_USD_M1_from_2020.csv')
-DATABASE_FILE_PATH = os.path.join('data', 'trading_data.db')
+DATA_DIRECTORY = 'data'
+DATABASE_FILE_PATH = os.path.join(DATA_DIRECTORY, 'trading_data.db')
 
-# ========================================================================
-# THE FIX: Change this table name to match what main.py expects.
-# ========================================================================
-TABLE_NAME = 'XAU_USD_1m' # Changed from 'XAUUSD_1m'
+def convert_all_csv_to_sqlite():
+    """
+    Scans the data directory for M1 CSV files, and writes each one to a
+    corresponding table in the SQLite database. This will replace tables
+    if they already exist.
+    """
+    # Find all M1 CSV files in the specified directory
+    csv_files = glob.glob(os.path.join(DATA_DIRECTORY, '*_M1_from_*.csv'))
 
-def convert_csv_to_sqlite():
-    """
-    Reads data from the specified CSV file and writes it to an SQLite database table.
-    This will replace the table if it already exists.
-    """
-    if not os.path.exists(CSV_FILE_PATH):
-        print(f"Error: CSV file not found at '{CSV_FILE_PATH}'")
+    if not csv_files:
+        print(f"No M1 CSV files found in the '{DATA_DIRECTORY}' directory.")
+        print("Please make sure your CSV files are named like 'INSTRUMENT_M1_from_YEAR.csv'")
         return
 
-    try:
-        print(f"Reading data from '{CSV_FILE_PATH}'...")
-        df = pd.read_csv(CSV_FILE_PATH)
-        df['DateTime'] = pd.to_datetime(df['DateTime']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        print(f"Found {len(df)} records in the CSV file.")
+    print(f"Found {len(csv_files)} CSV files to process.")
 
+    try:
         print(f"Connecting to database '{DATABASE_FILE_PATH}'...")
         with sqlite3.connect(DATABASE_FILE_PATH) as con:
-            print(f"Writing data to table '{TABLE_NAME}'... This may take a moment.")
-            
-            # This will now create/replace the correctly named table.
-            df.to_sql(name=TABLE_NAME, con=con, if_exists='replace', index=False)
+            for csv_file_path in csv_files:
+                try:
+                    # --- 1. Determine Table Name from Filename ---
+                    # Example: 'data/XAU_USD_M1_from_2020.csv' -> 'XAU_USD_1m'
+                    filename = os.path.basename(csv_file_path)
+                    instrument_name = filename.split('_M1_from_')[0]
+                    table_name = f"{instrument_name}_1m"
+                    
+                    print(f"\n--- Processing '{filename}' ---")
+                    print(f"Target table: '{table_name}'")
 
-        print("\nSuccessfully converted CSV data to the SQLite database!")
+                    # --- 2. Read and Format CSV Data ---
+                    print(f"Reading data from '{csv_file_path}'...")
+                    df = pd.read_csv(csv_file_path)
+                    
+                    # Ensure DateTime column exists and is formatted correctly
+                    if 'DateTime' not in df.columns:
+                        print(f"Warning: 'DateTime' column not found in '{filename}'. Skipping file.")
+                        continue
+                        
+                    df['DateTime'] = pd.to_datetime(df['DateTime']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"Found {len(df)} records.")
+
+                    # --- 3. Write to SQLite Database ---
+                    print(f"Writing data to table '{table_name}'... This may take a moment.")
+                    # This will create or replace the table with the new data.
+                    df.to_sql(name=table_name, con=con, if_exists='replace', index=False)
+                    print(f"Successfully wrote data to '{table_name}'.")
+
+                except Exception as e:
+                    print(f"An error occurred while processing file '{csv_file_path}': {e}")
+                    print("Skipping to the next file.")
+
+        print("\n======================================================")
+        print("Successfully converted all CSV files to the SQLite database!")
+        print("======================================================")
 
     except Exception as e:
-        print(f"\nAn error occurred: {e}")
+        print(f"\nAn error occurred with the database connection: {e}")
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    convert_csv_to_sqlite()
+    convert_all_csv_to_sqlite()

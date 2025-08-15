@@ -11,7 +11,7 @@ DATABASE_FILE_PATH = os.path.join('data', 'trading_data.db')
 
 # The name for the new table inside the database
 # IMPORTANT: This must match the format your backend expects
-TABLE_NAME = 'BTCUSDT_1m'
+TABLE_NAME = 'BTC_USDT_1m'
 
 def convert_csv_to_sqlite():
     """
