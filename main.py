@@ -724,7 +724,7 @@ def resample_weekly_monthly_via_daily(df, rule, instrument):
     if final_df.index.tz is None:
         final_df.index = final_df.index.tz_localize('UTC')
     
-    LOG.info(f"Manual {rule} resampling complete: {len(daily_df)} daily -> {len(final_df)} {rule} candles")
+    LOG.info(f"Manual {rule} resampling complete: {len(daily_df)} daily â†’ {len(final_df)} {rule} candles")
     return final_df
 
 # --- Keep ALL existing helper functions with modifications ---
@@ -1007,8 +1007,6 @@ def resample_data(df, rule, instrument=None):
     return resampled_df
 
 def get_data_from_db(table_name):
-    # This function now only fetches from the DB if not in cache.
-    # The cache will now store 1m data, which is what this function is asked to fetch.
     if table_name in CACHE:
         LOG.info(f"Cache hit for '{table_name}'.")
         return CACHE[table_name]
@@ -1127,14 +1125,14 @@ async def lifespan(app: FastAPI):
             df = get_data_from_db(table_name)
             if df is not None and not df.empty:
                 loaded_count += 1
-                LOG.info(f"Loaded {len(df)} records for {instrument}")
+                LOG.info(f"âœ“ Loaded {len(df)} records for {instrument}")
             else:
                 failed_instruments.append(instrument)
-                LOG.warning(f"No data found for {instrument}")
+                LOG.warning(f"âœ— No data found for {instrument}")
                 
         except Exception as e:
             failed_instruments.append(instrument)
-            LOG.error(f"Failed to load {instrument}: {e}")
+            LOG.error(f"âœ— Failed to load {instrument}: {e}")
     
     LOG.info(f"Pre-loading complete: {loaded_count}/{len(all_instruments)} instruments loaded successfully")
     if failed_instruments:
@@ -1172,7 +1170,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173", 
+        "https://strong-biscuit-0ff55.netlify.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1189,70 +1191,69 @@ async def get_chart_data(
     replay_anchor_timeframe: str | None = None
 ):
     LOG.info(f"Request for {instrument} @ {timeframe}")
-    
-    # --- PERFORMANCE FIX: CACHE RESAMPLED DATA ---
-    # Create a unique cache key for each instrument and timeframe combination
-    resampled_cache_key = f"{instrument}_{timeframe}"
-    
-    if resampled_cache_key in CACHE:
-        LOG.info(f"Resampled data cache hit for '{resampled_cache_key}'.")
-        resampled_df = CACHE[resampled_cache_key]
-    else:
-        LOG.info(f"Resampled data cache miss for '{resampled_cache_key}'. Calculating...")
-        base_table_name = format_instrument_to_tablename(instrument, "1m")
-        base_df = get_data_from_db(base_table_name)
-        if base_df is None or base_df.empty:
-            LOG.error(f"Base data for table '{base_table_name}' not found.")
-            return []
+    base_table_name = format_instrument_to_tablename(instrument, "1m")
 
-        # Perform the expensive resampling operation ONCE
-        market_type = get_market_type(instrument)
-        if is_2d_or_above(timeframe):
-            resampled_df = resample_weekly_monthly_via_daily(base_df.copy(), timeframe, instrument)
-        elif market_type == 'CRYPTO':
-            resampled_df = resample_crypto_data(base_df.copy(), timeframe, instrument)
-        else:
-            resampled_df = resample_data_dst_aware(base_df.copy(), timeframe, instrument)
-        
-        # Store the result in the cache for future requests
-        CACHE[resampled_cache_key] = resampled_df
-        LOG.info(f"Successfully calculated and cached {len(resampled_df)} records for '{resampled_cache_key}'.")
+    base_df = get_data_from_db(base_table_name)
+    if base_df is None:
+        LOG.error(f"Base data for table '{base_table_name}' not found.")
+        return []
 
-    # --- MAIN FIX: EFFICIENTLY SLICE THE RESAMPLED DATAFRAME ---
     if replay_anchor_time and replay_anchor_timeframe:
         anchor_start_dt = pd.to_datetime(replay_anchor_time, utc=True)
-        # Simplified logic for replay start, assuming resampled_df is already correct
-        # Find the position of the candle at or just before the anchor time
-        end_pos = resampled_df.index.searchsorted(anchor_start_dt, side='right')
-        start_pos = max(0, end_pos - limit)
-        final_df = resampled_df.iloc[start_pos:end_pos]
+        anchor_timeframe_minutes = parse_timeframe_to_minutes(replay_anchor_timeframe)
+        target_timeframe_minutes = parse_timeframe_to_minutes(timeframe)
+        if anchor_timeframe_minutes == 0 or target_timeframe_minutes == 0:
+            raise HTTPException(status_code=400, detail="Invalid timeframe for replay.")
+        anchor_end_dt = anchor_start_dt + pd.to_timedelta(anchor_timeframe_minutes + 59, unit='m')
+        anchor_end_minutes = anchor_end_dt.hour * 60 + anchor_end_dt.minute
+        target_candle_start_minutes = (anchor_end_minutes // target_timeframe_minutes) * target_timeframe_minutes
+        target_candle_start_dt = anchor_start_dt.replace(hour=0, minute=0, second=0, microsecond=0) + pd.to_timedelta(target_candle_start_minutes, unit='m')
+        
+        # UPDATED: Use appropriate resampling based on market type and timeframe
+        market_type = get_market_type(instrument)
+        if is_2d_or_above(timeframe):
+            # Use daily-based resampling for 2D and above (2D, 3D, W, MO)
+            # IMPORTANT: Use FULL dataset for resampling, then filter
+            resampled_df = resample_weekly_monthly_via_daily(base_df.copy(), timeframe, instrument)
+        elif market_type == 'CRYPTO':
+            # Use simple resampling for crypto
+            resampled_df = resample_crypto_data(base_df.copy(), timeframe, instrument)
+        else:
+            # Use DST-aware resampling for forex/metals/indices (sub-daily timeframes)
+            resampled_df = resample_data_dst_aware(base_df.copy(), timeframe, instrument)
+            
+        # Apply limit AFTER resampling
+        final_df = resampled_df[resampled_df.index <= target_candle_start_dt].tail(limit)
     else:
+        # UPDATED: Use appropriate resampling based on market type and timeframe
+        market_type = get_market_type(instrument)
+        
+        # CRITICAL FIX: Do resampling FIRST with full dataset
+        if is_2d_or_above(timeframe):
+            # Use daily-based resampling for 2D and above (2D, 3D, W, MO)
+            # Pass FULL base_df to resampling function
+            resampled_df = resample_weekly_monthly_via_daily(base_df.copy(), timeframe, instrument)
+        elif market_type == 'CRYPTO':
+            # Use simple resampling for crypto
+            resampled_df = resample_crypto_data(base_df.copy(), timeframe, instrument)
+        else:
+            # Use DST-aware resampling for forex/metals/indices (sub-daily timeframes)
+            resampled_df = resample_data_dst_aware(base_df.copy(), timeframe, instrument)
+        
+        # CRITICAL FIX: Apply filtering and limits AFTER resampling
         if after_date:
             after_datetime = pd.to_datetime(after_date, utc=True)
-            # This logic is efficient for fetching future data
             final_df = resampled_df[resampled_df.index > after_datetime].head(limit)
         elif end_date:
             end_datetime = pd.to_datetime(end_date, utc=True)
-            
-            # --- LAZY LOADING FIX ---
-            # 1. Find the integer position of the end_date. 'right' gets the index for insertion,
-            # which is what we want for slicing everything *before* it.
-            end_pos = resampled_df.index.searchsorted(end_datetime, side='right')
-            
-            # 2. Calculate the start position, ensuring it doesn't go below zero.
-            start_pos = max(0, end_pos - limit)
-            
-            # 3. Slice using integer positions. This is extremely fast and memory-efficient.
-            final_df = resampled_df.iloc[start_pos:end_pos]
-            # --- END LAZY LOADING FIX ---
+            final_df = resampled_df[resampled_df.index < end_datetime].tail(limit)
         else:
-            # Initial load from the most recent data
+            # Apply limit AFTER resampling
             final_df = resampled_df.tail(limit)
 
     if final_df.empty:
          return []
 
-    # Keep your debug logging if you find it useful
     if timeframe.upper() == '1D':
         debug_df = final_df.copy().reset_index()
         debug_df['DateTime'] = debug_df['DateTime'].dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -1261,14 +1262,13 @@ async def get_chart_data(
         LOG.info(f"=== DEBUG: Last {len(last_20)} daily candles for {instrument} @ {timeframe} (most recent first) ===")
         for i, row in last_20.iterrows():
             LOG.info(f"Candle: {row['DateTime']} ({pd.to_datetime(row['DateTime']).strftime('%A')}) | O:{row['Open']:.5f} H:{row['High']:.5f} L:{row['Low']:.5f} C:{row['Close']:.5f}")
-        LOG.info("=== END DEBUG ===")
+            LOG.info("=== END DEBUG ===")
 
     final_df = final_df.reset_index()
     final_df['DateTime'] = final_df['DateTime'].dt.strftime('%Y-%m-%d %H:%M:%S')
     
     LOG.info(f"Serving {len(final_df)} records.")
     return final_df.to_dict(orient='records')
-
 
 # --- API Endpoints ---
 @app.get("/api/data")
