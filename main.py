@@ -724,7 +724,7 @@ def resample_weekly_monthly_via_daily(df, rule, instrument):
     if final_df.index.tz is None:
         final_df.index = final_df.index.tz_localize('UTC')
     
-    LOG.info(f"Manual {rule} resampling complete: {len(daily_df)} daily â†’ {len(final_df)} {rule} candles")
+    LOG.info(f"Manual {rule} resampling complete: {len(daily_df)} daily -> {len(final_df)} {rule} candles")
     return final_df
 
 # --- Keep ALL existing helper functions with modifications ---
@@ -1125,14 +1125,14 @@ async def lifespan(app: FastAPI):
             df = get_data_from_db(table_name)
             if df is not None and not df.empty:
                 loaded_count += 1
-                LOG.info(f"✓ Loaded {len(df)} records for {instrument}")
+                LOG.info(f"Loaded {len(df)} records for {instrument}")
             else:
                 failed_instruments.append(instrument)
-                LOG.warning(f"✗ No data found for {instrument}")
+                LOG.warning(f"No data found for {instrument}")
                 
         except Exception as e:
             failed_instruments.append(instrument)
-            LOG.error(f"✗ Failed to load {instrument}: {e}")
+            LOG.error(f"Failed to load {instrument}: {e}")
     
     LOG.info(f"Pre-loading complete: {loaded_count}/{len(all_instruments)} instruments loaded successfully")
     if failed_instruments:
@@ -1198,6 +1198,8 @@ async def get_chart_data(
         LOG.error(f"Base data for table '{base_table_name}' not found.")
         return []
 
+    # --- START: NO CHANGES IN THIS SECTION ---
+    # The replay anchor logic remains the same.
     if replay_anchor_time and replay_anchor_timeframe:
         anchor_start_dt = pd.to_datetime(replay_anchor_time, utc=True)
         anchor_timeframe_minutes = parse_timeframe_to_minutes(replay_anchor_timeframe)
@@ -1209,49 +1211,52 @@ async def get_chart_data(
         target_candle_start_minutes = (anchor_end_minutes // target_timeframe_minutes) * target_timeframe_minutes
         target_candle_start_dt = anchor_start_dt.replace(hour=0, minute=0, second=0, microsecond=0) + pd.to_timedelta(target_candle_start_minutes, unit='m')
         
-        # UPDATED: Use appropriate resampling based on market type and timeframe
         market_type = get_market_type(instrument)
         if is_2d_or_above(timeframe):
-            # Use daily-based resampling for 2D and above (2D, 3D, W, MO)
-            # IMPORTANT: Use FULL dataset for resampling, then filter
             resampled_df = resample_weekly_monthly_via_daily(base_df.copy(), timeframe, instrument)
         elif market_type == 'CRYPTO':
-            # Use simple resampling for crypto
             resampled_df = resample_crypto_data(base_df.copy(), timeframe, instrument)
         else:
-            # Use DST-aware resampling for forex/metals/indices (sub-daily timeframes)
             resampled_df = resample_data_dst_aware(base_df.copy(), timeframe, instrument)
             
-        # Apply limit AFTER resampling
         final_df = resampled_df[resampled_df.index <= target_candle_start_dt].tail(limit)
+    # --- END: NO CHANGES IN THIS SECTION ---
     else:
-        # UPDATED: Use appropriate resampling based on market type and timeframe
+        # --- START: MODIFIED LOGIC ---
+        # This is the section that has been changed to correctly handle end_date.
+        
         market_type = get_market_type(instrument)
         
-        # CRITICAL FIX: Do resampling FIRST with full dataset
+        # Step 1: Resample the ENTIRE dataset first. This is crucial.
         if is_2d_or_above(timeframe):
-            # Use daily-based resampling for 2D and above (2D, 3D, W, MO)
-            # Pass FULL base_df to resampling function
             resampled_df = resample_weekly_monthly_via_daily(base_df.copy(), timeframe, instrument)
         elif market_type == 'CRYPTO':
-            # Use simple resampling for crypto
             resampled_df = resample_crypto_data(base_df.copy(), timeframe, instrument)
         else:
-            # Use DST-aware resampling for forex/metals/indices (sub-daily timeframes)
             resampled_df = resample_data_dst_aware(base_df.copy(), timeframe, instrument)
         
-        # CRITICAL FIX: Apply filtering and limits AFTER resampling
+        # Step 2: Apply filtering and limits AFTER resampling.
         if after_date:
+            # This logic for fetching future data was already correct.
             after_datetime = pd.to_datetime(after_date, utc=True)
             final_df = resampled_df[resampled_df.index > after_datetime].head(limit)
+        
+        # --- THIS IS THE KEY FIX ---
         elif end_date:
+            # If an end_date is provided (for starting a replay):
+            # 1. Convert the end_date string to a datetime object.
             end_datetime = pd.to_datetime(end_date, utc=True)
-            # FIX applied here: Correctly filter the resampled data first, then apply the tail limit.
-            filtered_df = resampled_df[resampled_df.index < end_datetime]
-            final_df = filtered_df.tail(limit)
+            # 2. First, filter the resampled data to get everything BEFORE the end_date.
+            historical_data = resampled_df[resampled_df.index < end_datetime]
+            # 3. THEN, take the last 'limit' records from that historical subset.
+            final_df = historical_data.tail(limit)
+            LOG.info(f"Fetched {len(final_df)} records before {end_date}")
+        # --- END OF KEY FIX ---
+            
         else:
-            # Apply limit AFTER resampling
+            # This is the default case for loading the chart with the most recent data.
             final_df = resampled_df.tail(limit)
+        # --- END: MODIFIED LOGIC ---
 
     if final_df.empty:
          return []
