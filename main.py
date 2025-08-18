@@ -1125,14 +1125,14 @@ async def lifespan(app: FastAPI):
             df = get_data_from_db(table_name)
             if df is not None and not df.empty:
                 loaded_count += 1
-                LOG.info(f"âœ“ Loaded {len(df)} records for {instrument}")
+                LOG.info(f"✓ Loaded {len(df)} records for {instrument}")
             else:
                 failed_instruments.append(instrument)
-                LOG.warning(f"âœ— No data found for {instrument}")
+                LOG.warning(f"✗ No data found for {instrument}")
                 
         except Exception as e:
             failed_instruments.append(instrument)
-            LOG.error(f"âœ— Failed to load {instrument}: {e}")
+            LOG.error(f"✗ Failed to load {instrument}: {e}")
     
     LOG.info(f"Pre-loading complete: {loaded_count}/{len(all_instruments)} instruments loaded successfully")
     if failed_instruments:
@@ -1246,7 +1246,9 @@ async def get_chart_data(
             final_df = resampled_df[resampled_df.index > after_datetime].head(limit)
         elif end_date:
             end_datetime = pd.to_datetime(end_date, utc=True)
-            final_df = resampled_df[resampled_df.index < end_datetime].tail(limit)
+            # FIX applied here: Correctly filter the resampled data first, then apply the tail limit.
+            filtered_df = resampled_df[resampled_df.index < end_datetime]
+            final_df = filtered_df.tail(limit)
         else:
             # Apply limit AFTER resampling
             final_df = resampled_df.tail(limit)
